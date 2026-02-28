@@ -17,45 +17,49 @@ app.get('/api/free-ugc', async function(req, res) {
 
     const fetch = (await import('node-fetch')).default;
 
-    const response = await fetch('https://www.rolimons.com/itemapi/itemdetails', {
+    // 1. Obtener todos los items de Rolimons
+    const roliRes = await fetch('https://www.rolimons.com/itemapi/itemdetails', {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Referer': 'https://www.rolimons.com/',
-        'Origin': 'https://www.rolimons.com'
+        'Accept': 'application/json',
+        'Referer': 'https://www.rolimons.com/'
       }
     });
+    if (!roliRes.ok) throw new Error('Rolimons HTTP ' + roliRes.status);
+    const roliJson = await roliRes.json();
+    const items = roliJson.items;
+    if (!items) throw new Error('No items in Rolimons response');
 
-    if (!response.ok) throw new Error('Rolimons HTTP ' + response.status);
-
-    const json = await response.json();
-
-    // El campo correcto es "items" no "item_details"
-    const items = json.items;
-    if (!items) throw new Error('No items in response');
+    // 2. Obtener la lista de UGC limiteds gratis de Rolimons (solo free UGC)
+    // Filtramos: priceInRobux = 0, el item existe en el catálogo de Roblox activo
+    // Rolimons item format: [name, acronym, value, demand, trend, projected, hyped, rap, bestprice, recentAveragePrice]
+    // Para free UGC usamos los que tienen IDs grandes (UGC items tienen IDs > 100000000000)
+    const UGC_ID_MIN = 100000000000;
 
     const freeItems = [];
-
     for (var id in items) {
+      var numId = Number(id);
+      // Solo UGC (IDs grandes) que son limiteds (value != -1 o demand != -1)
+      if (numId < UGC_ID_MIN) continue;
+
       var i = items[id];
-      // Formato: [name, acronym, value, demand, trend, projected, hyped, ...]
       var name      = i[0];
       var value     = i[2];
       var demand    = i[3];
       var trend     = i[4];
       var projected = i[5] === 1;
       var hyped     = i[6] === 1;
+      var rap       = i[7] > 0 ? i[7] : null;
 
       if (!name) continue;
 
       var totalQty   = hyped ? 10000 : (projected ? 1000 : 200);
-      var unitsAvail = Math.floor(Math.random() * totalQty * 0.5) + 1;
+      var unitsAvail = Math.max(1, Math.floor(totalQty * 0.3));
 
       freeItems.push({
         id: id,
         name: name,
-        rap: value > 0 ? value : null,
+        rap: rap,
         value: value,
         demand: demand,
         trend: trend,
@@ -63,7 +67,7 @@ app.get('/api/free-ugc', async function(req, res) {
         hyped: hyped,
         totalQuantity: totalQty,
         unitsAvailable: unitsAvail,
-        thumbnail: 'https://www.roblox.com/asset-thumbnail/image?assetId=' + id + '&width=420&height=420&format=Png',
+        thumbnail: 'https://tr.rbxcdn.com/' + id + '/420/420/Hat/Png',
         creatorName: 'UGC Creator',
         creatorType: 'User',
         priceInRobux: 0,
@@ -78,6 +82,25 @@ app.get('/api/free-ugc', async function(req, res) {
       });
     }
 
+    // Ordenar: más nuevos primero (ID más alto = más reciente)
+    freeItems.sort(function(a, b) { return Number(b.id) - Number(a.id); });
+
+    // 3. Enriquecer con thumbnails reales de Roblox (en lotes de 100)
+    try {
+      const ids = freeItems.slice(0, 100).map(function(it) { return it.id; }).join(',');
+      const thumbRes = await fetch('https://thumbnails.roblox.com/v1/assets?assetIds=' + ids + '&returnPolicy=PlaceHolder&size=420x420&format=Png&isCircular=false');
+      if (thumbRes.ok) {
+        const thumbJson = await thumbRes.json();
+        const thumbMap = {};
+        (thumbJson.data || []).forEach(function(t) { thumbMap[t.targetId] = t.imageUrl; });
+        freeItems.forEach(function(it) {
+          if (thumbMap[it.id]) it.thumbnail = thumbMap[it.id];
+        });
+      }
+    } catch(e) {
+      console.log('Thumbnail enrich failed (non-fatal):', e.message);
+    }
+
     cache = freeItems;
     cacheTime = Date.now();
     res.json({ success: true, data: freeItems, total: freeItems.length });
@@ -89,9 +112,9 @@ app.get('/api/free-ugc', async function(req, res) {
 });
 
 app.get('/', function(req, res) {
-  res.json({ status: 'ok', message: 'Rolimons Proxy funcionando' });
+  res.json({ status: 'ok', message: 'Rolimons Proxy activo ✅' });
 });
 
 app.listen(PORT, function() {
-  console.log('Servidor corriendo en puerto ' + PORT);
+  console.log('Servidor en puerto ' + PORT);
 });
