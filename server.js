@@ -8,6 +8,7 @@ const PORT = process.env.PORT || 3000;
 let cache = null;
 let cacheTime = 0;
 const CACHE_MS = 5 * 60 * 1000;
+const UGC_ID_MIN = 100000000000; // IDs de UGC son muy grandes
 
 app.get('/api/free-ugc', async function(req, res) {
   try {
@@ -17,10 +18,10 @@ app.get('/api/free-ugc', async function(req, res) {
 
     const fetch = (await import('node-fetch')).default;
 
-    // 1. Obtener todos los items de Rolimons
+    // ── 1. Datos de Rolimons ──────────────────────────────────
     const roliRes = await fetch('https://www.rolimons.com/itemapi/itemdetails', {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Accept': 'application/json',
         'Referer': 'https://www.rolimons.com/'
       }
@@ -30,33 +31,67 @@ app.get('/api/free-ugc', async function(req, res) {
     const items = roliJson.items;
     if (!items) throw new Error('No items in Rolimons response');
 
-    // 2. Obtener la lista de UGC limiteds gratis de Rolimons (solo free UGC)
-    // Filtramos: priceInRobux = 0, el item existe en el catálogo de Roblox activo
-    // Rolimons item format: [name, acronym, value, demand, trend, projected, hyped, rap, bestprice, recentAveragePrice]
-    // Para free UGC usamos los que tienen IDs grandes (UGC items tienen IDs > 100000000000)
-    const UGC_ID_MIN = 100000000000;
+    // ── 2. Filtrar solo UGC (IDs grandes) ────────────────────
+    const ugcIds = Object.keys(items).filter(id => Number(id) >= UGC_ID_MIN);
 
-    const freeItems = [];
-    for (var id in items) {
-      var numId = Number(id);
-      // Solo UGC (IDs grandes) que son limiteds (value != -1 o demand != -1)
-      if (numId < UGC_ID_MIN) continue;
+    // Tomar los más recientes (IDs más altos = más nuevos)
+    ugcIds.sort((a, b) => Number(b) - Number(a));
+    const top = ugcIds.slice(0, 200); // máximo 200 para no sobrecargar
 
-      var i = items[id];
-      var name      = i[0];
-      var value     = i[2];
-      var demand    = i[3];
-      var trend     = i[4];
-      var projected = i[5] === 1;
-      var hyped     = i[6] === 1;
-      var rap       = i[7] > 0 ? i[7] : null;
+    // ── 3. Thumbnails desde Roblox (lotes de 100) ────────────
+    const thumbMap = {};
+    try {
+      for (let i = 0; i < top.length; i += 100) {
+        const batch = top.slice(i, i + 100).join(',');
+        const tRes = await fetch(
+          'https://thumbnails.roblox.com/v1/assets?assetIds=' + batch +
+          '&returnPolicy=PlaceHolder&size=420x420&format=Png&isCircular=false'
+        );
+        if (tRes.ok) {
+          const tJson = await tRes.json();
+          (tJson.data || []).forEach(t => { thumbMap[String(t.targetId)] = t.imageUrl; });
+        }
+      }
+    } catch(e) { console.log('Thumbnails error (non-fatal):', e.message); }
 
-      if (!name) continue;
+    // ── 4. Creadores desde Roblox Economy API (lotes de 50) ──
+    const creatorMap = {};
+    try {
+      for (let i = 0; i < top.length; i += 50) {
+        const batch = top.slice(i, i + 50);
+        for (const id of batch) {
+          try {
+            const eRes = await fetch('https://economy.roblox.com/v2/assets/' + id + '/details');
+            if (eRes.ok) {
+              const eJson = await eRes.json();
+              if (eJson.Creator) {
+                creatorMap[id] = {
+                  name: eJson.Creator.Name || 'UGC Creator',
+                  type: eJson.Creator.CreatorType || 'User'
+                };
+              }
+            }
+          } catch(e2) { /* skip */ }
+        }
+      }
+    } catch(e) { console.log('Creators error (non-fatal):', e.message); }
 
-      var totalQty   = hyped ? 10000 : (projected ? 1000 : 200);
-      var unitsAvail = Math.max(1, Math.floor(totalQty * 0.3));
+    // ── 5. Construir lista final ──────────────────────────────
+    const freeItems = top.map(id => {
+      const i = items[id];
+      const name      = i[0];
+      const value     = i[2];
+      const demand    = i[3];
+      const trend     = i[4];
+      const projected = i[5] === 1;
+      const hyped     = i[6] === 1;
+      const rap       = i[7] > 0 ? i[7] : null;
 
-      freeItems.push({
+      const totalQty   = hyped ? 10000 : (projected ? 1000 : 200);
+      const unitsAvail = Math.max(1, Math.floor(totalQty * 0.3));
+      const creator    = creatorMap[id] || { name: 'UGC Creator', type: 'User' };
+
+      return {
         id: id,
         name: name,
         rap: rap,
@@ -67,9 +102,9 @@ app.get('/api/free-ugc', async function(req, res) {
         hyped: hyped,
         totalQuantity: totalQty,
         unitsAvailable: unitsAvail,
-        thumbnail: 'https://tr.rbxcdn.com/' + id + '/420/420/Hat/Png',
-        creatorName: 'UGC Creator',
-        creatorType: 'User',
+        thumbnail: thumbMap[id] || null,
+        creatorName: creator.name,
+        creatorType: creator.type,
         priceInRobux: 0,
         assetType: 'Accessory',
         saleLocation: 'Everywhere',
@@ -77,29 +112,10 @@ app.get('/api/free-ugc', async function(req, res) {
         favorites: 0,
         purchaseLimit: 1,
         robloxUrl: 'https://www.roblox.com/catalog/' + id,
-        roliUrl: 'https://www.rolimons.com/item/' + id,
-        tryOnUrl: 'https://www.roblox.com/catalog/' + id + '?tryOn=true'
-      });
-    }
-
-    // Ordenar: más nuevos primero (ID más alto = más reciente)
-    freeItems.sort(function(a, b) { return Number(b.id) - Number(a.id); });
-
-    // 3. Enriquecer con thumbnails reales de Roblox (en lotes de 100)
-    try {
-      const ids = freeItems.slice(0, 100).map(function(it) { return it.id; }).join(',');
-      const thumbRes = await fetch('https://thumbnails.roblox.com/v1/assets?assetIds=' + ids + '&returnPolicy=PlaceHolder&size=420x420&format=Png&isCircular=false');
-      if (thumbRes.ok) {
-        const thumbJson = await thumbRes.json();
-        const thumbMap = {};
-        (thumbJson.data || []).forEach(function(t) { thumbMap[t.targetId] = t.imageUrl; });
-        freeItems.forEach(function(it) {
-          if (thumbMap[it.id]) it.thumbnail = thumbMap[it.id];
-        });
-      }
-    } catch(e) {
-      console.log('Thumbnail enrich failed (non-fatal):', e.message);
-    }
+        roliUrl:   'https://www.rolimons.com/item/' + id,
+        tryOnUrl:  'https://www.roblox.com/catalog/' + id + '?tryOn=true'
+      };
+    }).filter(item => item.name);
 
     cache = freeItems;
     cacheTime = Date.now();
