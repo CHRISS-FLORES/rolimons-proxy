@@ -6,7 +6,7 @@ app.use(cors());
 const PORT = process.env.PORT || 3000;
 let cacheData = null;
 let cacheTime = 0;
-const CACHE_MS = 8 * 60 * 1000; // 8 min cache
+const CACHE_MS = 8 * 60 * 1000;
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -16,13 +16,6 @@ function assetTypeName(id) {
     44:'Shoulder Accessory',45:'Front Accessory',46:'Back Accessory',
     47:'Waist Accessory',64:'Emote',76:'Shoes'};
   return t[id] || 'Accessory';
-}
-
-function formatDate(str) {
-  if (!str) return '—';
-  try {
-    return new Date(str).toLocaleDateString('en-US', {month:'short', day:'numeric', year:'numeric'});
-  } catch(e) { return '—'; }
 }
 
 app.get('/api/free-ugc', async function(req, res) {
@@ -42,93 +35,156 @@ app.get('/api/free-ugc', async function(req, res) {
     const roliJson = await roliRes.json();
     const allRoli = roliJson.items || {};
 
-    // Solo UGC (ID >= 1 billion), ordenados más nuevos primero
     const ugcList = [];
     for (const id in allRoli) {
       if (Number(id) < 1000000000) continue;
       const i = allRoli[id];
       if (!i[0]) continue;
-      ugcList.push({ id, name: i[0], value: i[2], demand: i[3], trend: i[4], projected: i[5]===1, hyped: i[6]===1, rap: i[7]>0 ? i[7] : null });
+      ugcList.push({
+        id, name: i[0], value: i[2], demand: i[3], trend: i[4],
+        projected: i[5]===1, hyped: i[6]===1, rap: i[7]>0 ? i[7] : null
+      });
     }
     ugcList.sort((a, b) => Number(b.id) - Number(a.id));
-    const top = ugcList.slice(0, 100); // 100 items más recientes
+    const top = ugcList.slice(0, 120);
+    const ids = top.map(i => i.id);
     console.log('UGC total:', ugcList.length, '| Procesando:', top.length);
 
     // ── PASO 2: Thumbnails en lote ────────────────────────────
     const thumbMap = {};
-    const ids = top.map(i => i.id);
     for (let i = 0; i < ids.length; i += 100) {
       const batch = ids.slice(i, i + 100).join(',');
       try {
-        const r = await fetch('https://thumbnails.roblox.com/v1/assets?assetIds=' + batch + '&returnPolicy=PlaceHolder&size=420x420&format=Png&isCircular=false');
+        const r = await fetch(
+          'https://thumbnails.roblox.com/v1/assets?assetIds=' + batch +
+          '&returnPolicy=PlaceHolder&size=420x420&format=Png&isCircular=false'
+        );
         if (r.ok) {
           const j = await r.json();
-          (j.data || []).forEach(t => { if (t.state === 'Completed') thumbMap[String(t.targetId)] = t.imageUrl; });
-        }
-      } catch(e) { console.log('Thumb error:', e.message); }
-    }
-
-    // ── PASO 3: Datos reales de cada item desde economy API ───
-    const detailMap = {};
-    for (let i = 0; i < top.length; i++) {
-      const id = top[i].id;
-      try {
-        const r = await fetch('https://economy.roblox.com/v2/assets/' + id + '/details', {
-          headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' }
-        });
-        if (r.ok) {
-          const j = await r.json();
-          detailMap[id] = {
-            creatorName:    j.Creator?.Name       || 'UGC Creator',
-            creatorType:    j.Creator?.CreatorType || 'User',
-            creatorId:      j.Creator?.CreatorTargetId || 0,
-            assetType:      assetTypeName(j.AssetTypeId),
-            description:    j.Description || '',
-            price:          j.PriceInRobux || 0,
-            lowestPrice:    j.LowestPrice  || j.PriceInRobux || 0,
-            unitsAvailable: j.Remaining    !== undefined ? j.Remaining : null,
-            totalQuantity:  j.SaleCount    !== undefined ? j.SaleCount : null,
-            purchaseLimit:  j.CollectiblesItemDetails?.CollectibleLowestResalePrice || null,
-            saleStatus:     j.IsForSale ? 'For Sale' : 'Off Sale',
-            created:        formatDate(j.Created),
-            updated:        formatDate(j.Updated),
-            favorites:      j.FavoriteCount || 0,
-            saleLocation:   'Everywhere'
-          };
-        }
-      } catch(e) { /* skip */ }
-
-      // Pausa cada 5 items para no ser bloqueados
-      if (i % 5 === 4) await sleep(500);
-    }
-
-    // ── PASO 4: Intentar obtener sale location desde catalog ──
-    // catalog.roblox.com/v2/assets?assetIds= devuelve saleLocationType
-    try {
-      for (let i = 0; i < ids.length; i += 50) {
-        const batch = ids.slice(i, i + 50).join('&assetIds=');
-        const r = await fetch('https://catalog.roblox.com/v2/assets?assetIds=' + batch, {
-          headers: { 'Accept': 'application/json' }
-        });
-        if (r.ok) {
-          const j = await r.json();
-          (j.data || []).forEach(item => {
-            const sid = String(item.id);
-            if (detailMap[sid]) {
-              const loc = item.saleLocationType;
-              detailMap[sid].saleLocation = loc === 2 ? 'Game Only' : loc === 4 ? 'Specific Games' : 'Everywhere';
-              // Si tiene gameId, intentar usar el gameName
-              if (item.gameId) detailMap[sid].gameId = item.gameId;
-            }
+          (j.data || []).forEach(t => {
+            if (t.state === 'Completed') thumbMap[String(t.targetId)] = t.imageUrl;
           });
         }
+      } catch(e) { console.log('Thumb error:', e.message); }
+      await sleep(300);
+    }
+
+    // ── PASO 3: Detalles en lote via catalog v1 POST ──────────
+    // Este endpoint acepta hasta 120 items a la vez
+    const detailMap = {};
+    for (let i = 0; i < ids.length; i += 120) {
+      const chunk = ids.slice(i, i + 120);
+      try {
+        const body = { items: chunk.map(id => ({ itemType: 'Asset', id: Number(id) })) };
+        const r = await fetch('https://catalog.roblox.com/v1/catalog/items/details', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'User-Agent': 'Mozilla/5.0'
+          },
+          body: JSON.stringify(body)
+        });
+        if (r.ok) {
+          const j = await r.json();
+          console.log('Catalog batch items returned:', (j.data||[]).length, '/', chunk.length);
+          (j.data || []).forEach(item => {
+            const sid = String(item.id);
+            detailMap[sid] = {
+              creatorName:    item.creatorName      || null,
+              creatorType:    item.creatorType      || 'User',
+              creatorId:      item.creatorTargetId  || 0,
+              assetType:      assetTypeName(item.assetType),
+              description:    item.description      || '',
+              favorites:      item.favoriteCount    || 0,
+              price:          item.price            || 0,
+              lowestPrice:    item.lowestPrice      || item.price || 0,
+              unitsAvailable: item.remaining        !== undefined ? item.remaining : null,
+              totalQuantity:  item.totalQuantity    || null,
+              purchaseLimit:  item.purchaseLimit    || null,
+              offSale:        item.offSale          || false,
+              saleLocationType: item.saleLocationType || 1
+            };
+          });
+        } else {
+          const errText = await r.text();
+          console.log('Catalog batch error:', r.status, errText.substring(0, 200));
+        }
+      } catch(e) { console.log('Catalog POST error:', e.message); }
+      await sleep(500);
+    }
+
+    // ── PASO 4: Creadores en lote via users/groups API ────────
+    // Agrupar por creatorId para pedir nombres en lote
+    const userIds = [...new Set(
+      Object.values(detailMap)
+        .filter(d => d.creatorType === 'User' && d.creatorId > 0)
+        .map(d => d.creatorId)
+    )];
+    const groupIds = [...new Set(
+      Object.values(detailMap)
+        .filter(d => d.creatorType === 'Group' && d.creatorId > 0)
+        .map(d => d.creatorId)
+    )];
+
+    const userNameMap = {};
+    const groupNameMap = {};
+
+    // Nombres de usuarios en lote
+    if (userIds.length > 0) {
+      for (let i = 0; i < userIds.length; i += 100) {
+        const batch = userIds.slice(i, i + 100);
+        try {
+          const r = await fetch('https://users.roblox.com/v1/users', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+            body: JSON.stringify({ userIds: batch, excludeBannedUsers: false })
+          });
+          if (r.ok) {
+            const j = await r.json();
+            (j.data || []).forEach(u => { userNameMap[u.id] = u.displayName || u.name; });
+          }
+        } catch(e) { console.log('Users API error:', e.message); }
         await sleep(300);
       }
-    } catch(e) { console.log('Catalog v2 error:', e.message); }
+    }
+
+    // Nombres de grupos en lote
+    if (groupIds.length > 0) {
+      for (let i = 0; i < groupIds.length; i += 50) {
+        const batch = groupIds.slice(i, i + 50).join(',');
+        try {
+          const r = await fetch('https://groups.roblox.com/v2/groups?groupIds=' + batch);
+          if (r.ok) {
+            const j = await r.json();
+            (j.data || []).forEach(g => { groupNameMap[g.id] = g.name; });
+          }
+        } catch(e) { console.log('Groups API error:', e.message); }
+        await sleep(300);
+      }
+    }
+
+    console.log('Usuarios resueltos:', Object.keys(userNameMap).length, '| Grupos:', Object.keys(groupNameMap).length);
 
     // ── PASO 5: Construir resultado ───────────────────────────
     const result = top.map(item => {
       const d = detailMap[item.id] || {};
+
+      // Resolver nombre real del creador
+      let creatorName = 'UGC Creator';
+      if (d.creatorId > 0) {
+        if (d.creatorType === 'Group' && groupNameMap[d.creatorId]) {
+          creatorName = groupNameMap[d.creatorId];
+        } else if (userNameMap[d.creatorId]) {
+          creatorName = userNameMap[d.creatorId];
+        } else if (d.creatorName) {
+          creatorName = d.creatorName;
+        }
+      }
+
+      const saleLocType = d.saleLocationType || 1;
+      const saleLocation = saleLocType === 2 ? 'Game Only' : saleLocType === 4 ? 'Specific Games' : 'Everywhere';
+
       const totalQty   = d.totalQuantity  != null ? d.totalQuantity  : (item.hyped ? 10000 : (item.projected ? 1000 : 200));
       const unitsAvail = d.unitsAvailable != null ? d.unitsAvailable : Math.floor(totalQty * 0.4);
 
@@ -144,7 +200,7 @@ app.get('/api/free-ugc', async function(req, res) {
         totalQuantity:  totalQty,
         unitsAvailable: unitsAvail,
         thumbnail:      thumbMap[item.id] || null,
-        creatorName:    d.creatorName  || 'UGC Creator',
+        creatorName:    creatorName,
         creatorType:    d.creatorType  || 'User',
         creatorId:      d.creatorId    || 0,
         assetType:      d.assetType    || 'Accessory',
@@ -152,27 +208,32 @@ app.get('/api/free-ugc', async function(req, res) {
         favorites:      d.favorites    || 0,
         price:          d.price        || 0,
         lowestPrice:    d.lowestPrice  || 0,
-        saleLocation:   d.saleLocation || 'Everywhere',
-        saleStatus:     d.saleStatus   || 'For Sale',
+        saleLocation:   saleLocation,
+        saleStatus:     d.offSale ? 'Off Sale' : 'For Sale',
         purchaseLimit:  d.purchaseLimit || 1,
-        created:        d.created      || '—',
-        updated:        d.updated      || '—',
         robloxUrl:      'https://www.roblox.com/catalog/' + item.id,
         roliUrl:        'https://www.rolimons.com/item/' + item.id,
         tryOnUrl:       'https://www.roblox.com/catalog/' + item.id + '?tryOn=true'
       };
     });
 
+    const uniqueCreators = new Set(result.map(r => r.creatorName)).size;
+    console.log('Final:', result.length, 'items | Creadores únicos:', uniqueCreators);
+
     cacheData = result;
     cacheTime = Date.now();
-    console.log('Resultado:', result.length, 'items | Creadores únicos:', new Set(result.map(r => r.creatorName)).size);
     res.json({ success: true, data: result, total: result.length });
 
   } catch (e) {
-    console.error('Error:', e.message);
+    console.error('Error principal:', e.message);
     res.status(500).json({ success: false, error: e.message });
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'ok', cached: !!cacheData, total: cacheData?.length || 0 }));
+app.get('/', (req, res) => res.json({
+  status: 'ok',
+  cached: !!cacheData,
+  total: cacheData ? cacheData.length : 0
+}));
+
 app.listen(PORT, () => console.log('✅ Puerto ' + PORT));
