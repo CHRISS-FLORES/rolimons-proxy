@@ -29,33 +29,36 @@ app.get('/api/free-ugc', async function(req, res) {
     const json = await response.json();
     const items = json.item_details;
 
+    if (!items) throw new Error('No item_details in response');
+
     const freeItems = [];
 
     for (var id in items) {
       var i = items[id];
-      // i = [name, acronym, value, demand, trend, projected, hyped, ...]
-      // Only include items with priceInRobux = 0 (free) and status = limited (value > 0 or demand >= 0)
-      var name     = i[0];
-      var value    = i[2];
-      var demand   = i[3];
-      var trend    = i[4];
+      // Rolimons format: [name, acronym, value, demand, trend, projected, hyped, ...]
+      var name      = i[0];
+      var value     = i[2];
+      var demand    = i[3];
+      var trend     = i[4];
       var projected = i[5] === 1;
-      var hyped    = i[6] === 1;
+      var hyped     = i[6] === 1;
 
-      // Filter: only limiteds (value != -1 means it has a rolimons value assigned)
-      if (value === -1 && demand === -1) continue;
+      if (!name) continue;
+
+      var totalQty   = hyped ? 10000 : (projected ? 1000 : 200);
+      var unitsAvail = Math.floor(Math.random() * totalQty * 0.5) + 1;
 
       freeItems.push({
         id: id,
         name: name,
-        rap: -1,
+        rap: value > 0 ? value : null,
         value: value,
         demand: demand,
         trend: trend,
         projected: projected,
         hyped: hyped,
-        totalQuantity: hyped ? 10000 : (projected ? 500 : 100),
-        unitsAvailable: demand > 0 ? Math.floor(Math.random() * 50) + 1 : 0,
+        totalQuantity: totalQty,
+        unitsAvailable: unitsAvail,
         thumbnail: 'https://www.roblox.com/asset-thumbnail/image?assetId=' + id + '&width=420&height=420&format=Png',
         creatorName: 'UGC Creator',
         creatorType: 'User',
