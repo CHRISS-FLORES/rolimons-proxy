@@ -17,25 +17,48 @@ app.get('/api/free-ugc', async function(req, res) {
 
     const fetch = (await import('node-fetch')).default;
 
-    const response = await fetch('https://www.rolimons.com/itemapi/itemdetails', {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'application/json'
+    // Intentar con diferentes endpoints de Rolimons
+    const urls = [
+      'https://www.rolimons.com/itemapi/itemdetails',
+      'https://rolimons.com/itemapi/itemdetails'
+    ];
+
+    let json = null;
+    let lastError = '';
+
+    for (var u of urls) {
+      try {
+        const response = await fetch(u, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': 'https://www.rolimons.com/',
+            'Origin': 'https://www.rolimons.com'
+          }
+        });
+        if (response.ok) {
+          json = await response.json();
+          break;
+        } else {
+          lastError = 'HTTP ' + response.status + ' from ' + u;
+        }
+      } catch(e) {
+        lastError = e.message;
       }
-    });
+    }
 
-    if (!response.ok) throw new Error('Rolimons error: ' + response.status);
+    if (!json) throw new Error('No response: ' + lastError);
 
-    const json = await response.json();
     const items = json.item_details;
-
-    if (!items) throw new Error('No item_details in response');
+    if (!items) {
+      // Devolver las keys que tiene el JSON para diagnosticar
+      return res.json({ success: false, error: 'No item_details', keys: Object.keys(json), sample: JSON.stringify(json).substring(0, 500) });
+    }
 
     const freeItems = [];
-
     for (var id in items) {
       var i = items[id];
-      // Rolimons format: [name, acronym, value, demand, trend, projected, hyped, ...]
       var name      = i[0];
       var value     = i[2];
       var demand    = i[3];
@@ -76,7 +99,6 @@ app.get('/api/free-ugc', async function(req, res) {
 
     cache = freeItems;
     cacheTime = Date.now();
-
     res.json({ success: true, data: freeItems, total: freeItems.length });
 
   } catch (e) {
