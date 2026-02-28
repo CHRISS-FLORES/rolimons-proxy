@@ -7,59 +7,89 @@ const PORT = process.env.PORT || 3000;
 let cacheData = null;
 let cacheTime = 0;
 const CACHE_MS = 5 * 60 * 1000;
-const UGC_MIN_ID = 1000000000;
 
+// ── HELPERS ───────────────────────────────────────────────────
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function assetTypeName(id) {
+  const t = {8:'Hat',11:'Shirt',12:'Pants',17:'Head',18:'Face',19:'Gear',
+    41:'Hair Accessory',42:'Face Accessory',43:'Neck Accessory',
+    44:'Shoulder Accessory',45:'Front Accessory',46:'Back Accessory',
+    47:'Waist Accessory',64:'Emote',76:'Shoes'};
+  return t[id] || 'Accessory';
+}
+
+// ── ENDPOINT PRINCIPAL ────────────────────────────────────────
 app.get('/api/free-ugc', async function(req, res) {
-  const forceRefresh = req.query.refresh === '1';
-  if (!forceRefresh && cacheData && (Date.now() - cacheTime) < CACHE_MS) {
+  const force = req.query.refresh === '1';
+  if (!force && cacheData && (Date.now() - cacheTime) < CACHE_MS) {
     return res.json({ success: true, data: cacheData, total: cacheData.length, cached: true });
   }
 
   try {
     const fetch = (await import('node-fetch')).default;
 
-    // ── 1. Lista de UGC limiteds de Rolimons ─────────────────
-    const roliRes = await fetch('https://www.rolimons.com/itemapi/itemdetails', {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'application/json',
-        'Referer': 'https://www.rolimons.com/'
+    // ── PASO 1: Buscar UGC Limiteds gratis en el catalogo de Roblox
+    // Usamos catalog.roblox.com para buscar items con precio 0 y tipo Limited
+    let allItems = [];
+    let cursor = '';
+    let paginas = 0;
+    const MAX_PAGINAS = 5; // 5 páginas x 120 items = hasta 600 items
+
+    do {
+      const url = 'https://catalog.roblox.com/v1/search/items/details?' +
+        'Category=Accessories&Subcategory=All&MaxPrice=0&MinPrice=0' +
+        '&salesTypeFilter=1&limit=120&sortType=3' + // sortType=3 = más recientes
+        (cursor ? '&cursor=' + cursor : '');
+
+      try {
+        const r = await fetch(url, {
+          headers: {
+            'Accept': 'application/json',
+            'User-Agent': 'Mozilla/5.0'
+          }
+        });
+        if (!r.ok) { console.log('Catalog page error:', r.status); break; }
+        const j = await r.json();
+        const items = (j.data || []).filter(i =>
+          i.itemRestrictions && i.itemRestrictions.includes('Limited')
+        );
+        allItems = allItems.concat(items);
+        cursor = j.nextPageCursor || '';
+        paginas++;
+        if (cursor) await sleep(300);
+      } catch(e) {
+        console.log('Catalog fetch error:', e.message);
+        break;
       }
-    });
-    if (!roliRes.ok) throw new Error('Rolimons HTTP ' + roliRes.status);
-    const roliJson = await roliRes.json();
-    const allItems = roliJson.items;
-    if (!allItems) throw new Error('Sin datos de Rolimons');
+    } while (cursor && paginas < MAX_PAGINAS);
 
-    // Filtrar solo UGC y ordenar más nuevos primero
-    const ugcList = [];
-    for (const id in allItems) {
-      if (Number(id) < UGC_MIN_ID) continue;
-      const i = allItems[id];
-      if (!i[0]) continue;
-      ugcList.push({
-        id: id,
-        name: i[0],
-        value: i[2],
-        demand: i[3],
-        trend: i[4],
-        projected: i[5] === 1,
-        hyped: i[6] === 1,
-        rap: i[7] > 0 ? i[7] : null
+    console.log('Items gratis limiteds encontrados:', allItems.length);
+
+    // Si el catálogo no devuelve nada, intentar con la API de Rolimons como fallback
+    if (allItems.length === 0) {
+      console.log('Usando fallback de Rolimons...');
+      const roliRes = await fetch('https://www.rolimons.com/itemapi/itemdetails', {
+        headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
       });
+      if (roliRes.ok) {
+        const roliJson = await roliRes.json();
+        const items = roliJson.items || {};
+        for (const id in items) {
+          if (Number(id) < 1000000000) continue;
+          const i = items[id];
+          if (i[0]) allItems.push({ id: Number(id), name: i[0], _fromRoli: true, _roliData: i });
+        }
+        allItems.sort((a, b) => b.id - a.id);
+        allItems = allItems.slice(0, 200);
+      }
     }
-    ugcList.sort((a, b) => Number(b.id) - Number(a.id));
 
-    // Tomar los primeros 200 más recientes
-    const top200 = ugcList.slice(0, 200);
-    const topIds = top200.map(i => i.id);
-
-    console.log('UGC encontrados:', ugcList.length, '| Procesando:', top200.length);
-
-    // ── 2. Thumbnails desde Roblox (lotes de 100) ────────────
+    // ── PASO 2: Obtener thumbnails (lotes de 100)
     const thumbMap = {};
-    for (let i = 0; i < topIds.length; i += 100) {
-      const batch = topIds.slice(i, i + 100).join(',');
+    const ids = allItems.map(i => String(i.id));
+    for (let i = 0; i < ids.length; i += 100) {
+      const batch = ids.slice(i, i + 100).join(',');
       try {
         const r = await fetch(
           'https://thumbnails.roblox.com/v1/assets?assetIds=' + batch +
@@ -72,79 +102,89 @@ app.get('/api/free-ugc', async function(req, res) {
           });
         }
       } catch(e) { console.log('Thumb error:', e.message); }
+      await sleep(200);
     }
 
-    // ── 3. Detalles reales desde Roblox Economy API ───────────
-    // Lotes de 10 para no saturar la API
+    // ── PASO 3: Detalles individuales desde catalog.roblox.com/v1/catalog/items/details
+    // Este endpoint acepta lotes de hasta 120 items
     const detailMap = {};
-    for (let i = 0; i < topIds.length; i += 10) {
-      const batch = topIds.slice(i, i + 10);
-      await Promise.all(batch.map(async id => {
-        try {
-          const r = await fetch('https://economy.roblox.com/v2/assets/' + id + '/details', {
-            headers: { 'Accept': 'application/json' }
-          });
-          if (r.ok) {
-            const j = await r.json();
-            detailMap[id] = {
-              creatorName: (j.Creator && j.Creator.Name) ? j.Creator.Name : 'UGC Creator',
-              creatorType: (j.Creator && j.Creator.CreatorType) ? j.Creator.CreatorType : 'User',
-              assetType:   j.AssetTypeId ? assetTypeName(j.AssetTypeId) : 'Accessory',
-              description: j.Description || '',
-              favorites:   j.FavoriteCount || 0,
-              saleLocation: 'Everywhere',
-              // Stock real: cantidad disponible
-              unitsAvailable: (j.Remaining !== undefined && j.Remaining !== null) ? j.Remaining : -1,
-              totalQuantity:  (j.SaleCount !== undefined && j.SaleCount !== null) ? j.SaleCount : -1,
-              purchaseLimit:  j.SaleAvailabilityLocations ? 2 : 1,
-              saleStatus:     j.IsForSale ? 'For Sale' : 'Off Sale',
-              created:        j.Created ? new Date(j.Created).toLocaleDateString('en-US', {month:'short',day:'numeric',year:'numeric'}) : '—',
-              updated:        j.Updated ? new Date(j.Updated).toLocaleDateString('en-US', {month:'short',day:'numeric',year:'numeric'}) : '—',
+    const idChunks = [];
+    for (let i = 0; i < ids.length; i += 120) idChunks.push(ids.slice(i, i + 120));
+
+    for (const chunk of idChunks) {
+      try {
+        const body = { items: chunk.map(id => ({ itemType: 'Asset', id: Number(id) })) };
+        const r = await fetch('https://catalog.roblox.com/v1/catalog/items/details', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        if (r.ok) {
+          const j = await r.json();
+          (j.data || []).forEach(item => {
+            detailMap[String(item.id)] = {
+              creatorName:   item.creatorName || 'UGC Creator',
+              creatorType:   item.creatorType || 'User',
+              creatorId:     item.creatorTargetId || 0,
+              assetType:     assetTypeName(item.assetType),
+              description:   item.description || '',
+              favorites:     item.favoriteCount || 0,
+              price:         item.price || 0,
+              lowestPrice:   item.lowestPrice || item.price || 0,
+              unitsAvailable: item.remaining !== undefined ? item.remaining : (item.unitsAvailableForConsumption || 0),
+              totalQuantity: item.totalQuantity || 0,
+              purchaseLimit: item.purchaseLimit || null,
+              saleLocation:  item.saleLocationType === 1 ? 'Everywhere' : (item.saleLocationType === 2 ? 'Game Only' : 'Everywhere'),
+              saleStatus:    item.offSale ? 'Off Sale' : 'For Sale',
+              itemRestrictions: item.itemRestrictions || [],
             };
-          }
-        } catch(e) { /* skip item */ }
-      }));
-      // Pequeña pausa para no ser bloqueados
-      await new Promise(r => setTimeout(r, 150));
+          });
+        }
+      } catch(e) { console.log('Detail batch error:', e.message); }
+      await sleep(300);
     }
 
-    // ── 4. Construir resultado final ──────────────────────────
-    const result = top200.map(item => {
-      const d = detailMap[item.id] || {};
-      const totalQty   = d.totalQuantity > 0 ? d.totalQuantity : (item.hyped ? 10000 : (item.projected ? 1000 : 200));
+    // ── PASO 4: Construir resultado final
+    const result = allItems.map(item => {
+      const id = String(item.id || item.Id);
+      const d = detailMap[id] || {};
+      const roliData = item._roliData || [];
+
+      const rap   = roliData[2] > 0 ? roliData[2] : null;
+      const value = roliData[2] > 0 ? roliData[2] : (d.lowestPrice || 0);
+
+      const totalQty   = d.totalQuantity > 0 ? d.totalQuantity : 200;
       const unitsAvail = d.unitsAvailable >= 0 ? d.unitsAvailable : Math.floor(totalQty * 0.4);
 
       return {
-        id:             item.id,
-        name:           item.name,
-        rap:            item.rap,
-        value:          item.value,
-        demand:         item.demand,
-        trend:          item.trend,
-        projected:      item.projected,
-        hyped:          item.hyped,
+        id:             id,
+        name:           item.name || item.Name || '—',
+        rap:            rap,
+        value:          value,
         totalQuantity:  totalQty,
         unitsAvailable: unitsAvail,
-        thumbnail:      thumbMap[item.id] || null,
-        creatorName:    d.creatorName    || 'UGC Creator',
+        thumbnail:      thumbMap[id] || item.thumbnail || null,
+        creatorName:    d.creatorName    || item.creatorName    || 'UGC Creator',
         creatorType:    d.creatorType    || 'User',
-        assetType:      d.assetType      || 'Accessory',
-        description:    d.description    || '',
-        favorites:      d.favorites      || 0,
+        creatorId:      d.creatorId      || 0,
+        assetType:      d.assetType      || assetTypeName(item.assetType) || 'Accessory',
+        description:    d.description    || item.description    || '',
+        favorites:      d.favorites      || item.favoriteCount  || 0,
+        price:          d.price          || item.price          || 0,
+        lowestPrice:    d.lowestPrice    || 0,
         saleLocation:   d.saleLocation   || 'Everywhere',
         saleStatus:     d.saleStatus     || 'For Sale',
         purchaseLimit:  d.purchaseLimit  || 1,
-        created:        d.created        || '—',
-        updated:        d.updated        || '—',
-        priceInRobux:   0,
-        robloxUrl:      'https://www.roblox.com/catalog/' + item.id,
-        roliUrl:        'https://www.rolimons.com/item/' + item.id,
-        tryOnUrl:       'https://www.roblox.com/catalog/' + item.id + '?tryOn=true'
+        priceInRobux:   d.price          || 0,
+        robloxUrl:      'https://www.roblox.com/catalog/' + id,
+        roliUrl:        'https://www.rolimons.com/item/' + id,
+        tryOnUrl:       'https://www.roblox.com/catalog/' + id + '?tryOn=true'
       };
-    });
+    }).filter(i => i.name !== '—');
 
     cacheData = result;
     cacheTime = Date.now();
+    console.log('Resultado final:', result.length, 'items');
     res.json({ success: true, data: result, total: result.length });
 
   } catch (e) {
@@ -153,22 +193,8 @@ app.get('/api/free-ugc', async function(req, res) {
   }
 });
 
-// Convertir AssetTypeId a nombre legible
-function assetTypeName(id) {
-  const types = {
-    8: 'Hat', 11: 'Shirt', 12: 'Pants', 17: 'Head', 18: 'Face',
-    19: 'Gear', 25: 'Arms', 26: 'Legs', 27: 'Torso',
-    41: 'Hair Accessory', 42: 'Face Accessory', 43: 'Neck Accessory',
-    44: 'Shoulder Accessory', 45: 'Front Accessory', 46: 'Back Accessory',
-    47: 'Waist Accessory', 64: 'Emote', 76: 'Shoes'
-  };
-  return types[id] || 'Accessory';
-}
-
 app.get('/', function(req, res) {
   res.json({ status: 'ok', cached: !!cacheData, total: cacheData ? cacheData.length : 0 });
 });
 
-app.listen(PORT, function() {
-  console.log('✅ Servidor activo en puerto ' + PORT);
-});
+app.listen(PORT, () => console.log('✅ Puerto ' + PORT));
